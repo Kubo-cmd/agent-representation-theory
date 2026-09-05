@@ -2,7 +2,7 @@
 
 A small, tested Python reference for finite-group representations and agent-symmetry experiments.
 
-The project turns abstract symmetry into matrices that can be validated, decomposed, and inspected. It supports cyclic groups and finite symmetric groups; the built-in complete character table is limited to S3. The agent layer builds a deterministic synthetic representation from a complete set of labeled observations; it does not claim to infer a physical or learned representation from text.
+The project turns abstract symmetry into matrices that can be validated, decomposed, and inspected. It supports cyclic groups and symmetric groups S2 through S8; the built-in complete character table is limited to S3. The agent layer builds a deterministic synthetic representation from a complete set of labeled observations; it does not claim to infer a physical or learned representation from text.
 
 ## What is implemented
 
@@ -57,6 +57,7 @@ Runtime dependency: NumPy. SciPy is not required.
 ## Scope and limits
 
 - Symmetric-group character tables are implemented only for S3.
+- Symmetric groups are capped at S8 because this compact implementation materializes all `n!` elements.
 - The observation builder is deterministic and mathematically valid, but synthetic. Descriptions select a reproducible mixture of cyclic irreducible modes; they are not embedded or learned.
 - Inputs are validated for the supported finite groups. This is not a symbolic algebra system.
 - Floating-point comparisons use configurable tolerances.

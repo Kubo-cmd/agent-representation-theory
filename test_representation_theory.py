@@ -109,6 +109,8 @@ class TestSymmetricGroup:
         for value in (1, 0, True, 2.5):
             with pytest.raises(ValueError, match="at least 2"):
                 SymmetricGroup(value)
+        with pytest.raises(ValueError, match="not exceed 8"):
+            SymmetricGroup(9)
         group = SymmetricGroup(3)
         for value in (
             (0, 1),

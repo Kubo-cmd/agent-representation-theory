@@ -259,11 +259,13 @@ class CyclicGroup:
 
 
 class SymmetricGroup:
-    """The symmetric group ``S_n`` using ordinary function composition."""
+    """The symmetric group ``S_n`` using standard permutation composition."""
 
     def __init__(self, n: int):
         if isinstance(n, bool) or not isinstance(n, int) or n < 2:
-            raise ValueError("n must be an integer of at least 2")
+            raise ValueError("n must be an integer at least 2")
+        if n > 8:
+            raise ValueError("n must not exceed 8; this implementation materializes n! elements")
         self.n = n
         self.elements = list(permutations(range(n)))
 
