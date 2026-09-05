@@ -1,502 +1,514 @@
+"""Finite-group representation tools for agent-symmetry experiments.
+
+The module implements exact group actions for cyclic groups and small symmetric
+groups. The observation adapter is explicitly synthetic: labels choose a stable
+mixture of cyclic irreducible modes, rather than pretending to learn a group
+action from text.
 """
-Agent Representation Theory
-How groups act on vector spaces, decomposing symmetries into irreducible components.
 
-Representation theory studies abstract groups by representing their elements as
-linear transformations of vector spaces. This makes abstract symmetry concrete
-and computable.
+from __future__ import annotations
 
-Core concepts:
-- Group representation: ρ: G → GL(V)
-- Irreducible representations (irreps): cannot be decomposed further
-- Characters: χ(g) = tr(ρ(g)), class functions
-- Schur's lemma: maps between irreps are scalar multiples of identity
-- Peter-Weyl theorem: matrix coefficients span L²(G)
-- Decomposition: V = ⊕ nᵢ Vᵢ (multiplicity spaces)
-
-Applications to agents:
-- Decompose agent behaviors into fundamental modes
-- Classify coordination patterns by character
-- Detect symmetry breaking in multi-agent systems
-- Analyze invariant subspaces of state space
-- Compute selection rules for allowed transitions
-"""
+import hashlib
+import json
+import math
+from dataclasses import dataclass
+from itertools import permutations
+from numbers import Real
+from typing import Callable, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
-from scipy import linalg
+
+Element = Hashable
+Multiply = Callable[[Element, Element], Element]
+
+
+def _tolerance(value: float) -> float:
+    """Return a finite, non-negative numerical tolerance."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("atol must be a finite non-negative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError("atol must be a finite non-negative number")
+    return result
+
+
+def _group_elements(elements: Sequence[Element]) -> Tuple[Element, ...]:
+    """Return a validated, non-empty tuple of unique group elements."""
+    normalized = tuple(elements)
+    if not normalized:
+        raise ValueError("group_elements must not be empty")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("group_elements contains duplicates")
+    return normalized
 
 
 @dataclass
 class Representation:
-    """
-    A group representation: maps group elements to invertible matrices.
-    
-    ρ: G → GL(V) where V is a vector space of dimension `dim`.
-    """
+    """A finite-dimensional complex representation ``rho: G -> GL(V)``."""
+
     name: str
     dim: int
-    matrices: Dict[str, NDArray]  # group_element → matrix
-    
-    def character(self, g: str) -> complex:
-        """Character: χ(g) = tr(ρ(g))."""
-        if g not in self.matrices:
-            raise ValueError(f"Group element {g} not in representation")
-        return np.trace(self.matrices[g])
-    
-    def is_faithful(self, identity_element: str = "e") -> bool:
-        """Check if representation is faithful (injective)."""
-        # Faithful if only identity maps to identity matrix
-        identity_matrix = np.eye(self.dim)
-        for g, matrix in self.matrices.items():
-            if np.allclose(matrix, identity_matrix) and g != identity_element:
+    matrices: Mapping[Element, NDArray]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dim, bool) or not isinstance(self.dim, int) or self.dim < 1:
+            raise ValueError("dim must be a positive integer")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("name must be a non-empty string")
+
+        checked: Dict[Element, NDArray] = {}
+        for element, value in self.matrices.items():
+            matrix = np.asarray(value, dtype=complex)
+            if matrix.shape != (self.dim, self.dim):
+                raise ValueError(
+                    f"matrix for {element!r} has shape {matrix.shape}; "
+                    f"expected {(self.dim, self.dim)}"
+                )
+            if not np.all(np.isfinite(matrix)):
+                raise ValueError(f"matrix for {element!r} contains non-finite values")
+            checked[element] = matrix.copy()
+        self.matrices = checked
+
+    def _require_elements(self, group_elements: Sequence[Element]) -> Tuple[Element, ...]:
+        elements = _group_elements(group_elements)
+        missing = [element for element in elements if element not in self.matrices]
+        if missing:
+            raise ValueError(f"representation is missing group elements: {missing!r}")
+        return elements
+
+    def character(self, element: Element) -> complex:
+        """Return the character ``chi(element) = trace(rho(element))``."""
+        if element not in self.matrices:
+            raise ValueError(f"Group element {element!r} not in representation")
+        return complex(np.trace(self.matrices[element]))
+
+    def is_faithful(
+        self,
+        identity_element: Optional[Element] = None,
+        atol: float = 1e-9,
+    ) -> bool:
+        """Return whether only the identity maps to the identity matrix.
+
+        When no identity label is supplied, it is inferred only if exactly one
+        represented element maps to the identity matrix.
+        """
+        atol = _tolerance(atol)
+        identity = np.eye(self.dim, dtype=complex)
+        if identity_element is None:
+            candidates = [
+                element
+                for element, matrix in self.matrices.items()
+                if np.allclose(matrix, identity, atol=atol, rtol=0)
+            ]
+            if len(candidates) != 1:
                 return False
+            identity_element = candidates[0]
+        if identity_element not in self.matrices:
+            return False
+        if not np.allclose(self.matrices[identity_element], identity, atol=atol, rtol=0):
+            return False
+        return all(
+            element == identity_element
+            or not np.allclose(matrix, identity, atol=atol, rtol=0)
+            for element, matrix in self.matrices.items()
+        )
+
+    def is_unitary(self, atol: float = 1e-9) -> bool:
+        """Return whether every matrix is unitary."""
+        atol = _tolerance(atol)
+        identity = np.eye(self.dim, dtype=complex)
+        return all(
+            np.allclose(matrix.conj().T @ matrix, identity, atol=atol, rtol=0)
+            for matrix in self.matrices.values()
+        )
+
+    def is_representation(
+        self,
+        group_elements: Sequence[Element],
+        multiply: Multiply,
+        identity_element: Element,
+        atol: float = 1e-9,
+    ) -> bool:
+        """Check identity, invertibility, closure, and the homomorphism law."""
+        atol = _tolerance(atol)
+        elements = self._require_elements(group_elements)
+        if identity_element not in elements:
+            raise ValueError("identity_element is not in group_elements")
+        identity = np.eye(self.dim, dtype=complex)
+        if not np.allclose(self.matrices[identity_element], identity, atol=atol, rtol=0):
+            return False
+        if any(abs(np.linalg.det(self.matrices[element])) <= atol for element in elements):
+            return False
+        element_set = set(elements)
+        for first in elements:
+            for second in elements:
+                product = multiply(first, second)
+                if product not in element_set:
+                    return False
+                if not np.allclose(
+                    self.matrices[product],
+                    self.matrices[first] @ self.matrices[second],
+                    atol=atol,
+                    rtol=0,
+                ):
+                    return False
         return True
-    
-    def is_irreducible(self, group_elements: List[str]) -> bool:
+
+    def character_inner_product(
+        self,
+        other: "Representation",
+        group_elements: Sequence[Element],
+    ) -> complex:
+        """Return ``<self, other>`` using the finite-group character product."""
+        elements = self._require_elements(group_elements)
+        other._require_elements(elements)
+        return sum(
+            np.conj(self.character(element)) * other.character(element)
+            for element in elements
+        ) / len(elements)
+
+    def is_irreducible(
+        self, group_elements: Sequence[Element], atol: float = 1e-8
+    ) -> bool:
+        """Apply the character norm criterion to an already-validated action.
+
+        Call :meth:`is_representation` first when matrices come from an
+        untrusted or external source.
         """
-        Check if representation is irreducible.
-        
-        Uses the criterion: ρ is irreducible iff 
-        (1/|G|) Σ_g |χ(g)|² = 1
-        """
-        char_sum = 0
-        for g in group_elements:
-            chi = self.character(g)
-            char_sum += np.abs(chi) ** 2
-        return np.isclose(char_sum / len(group_elements), 1.0)
-    
-    def decompose(self, irreps: List['Representation'], 
-                  group_elements: List[str]) -> Dict[str, int]:
-        """
-        Decompose this representation into irreducible components.
-        
-        Uses character orthogonality:
-        nᵢ = (1/|G|) Σ_g χᵢ(g)* χ(g)
-        
-        Returns: {irrep_name: multiplicity}
-        """
-        multiplicities = {}
-        
+        atol = _tolerance(atol)
+        norm = self.character_inner_product(self, group_elements)
+        return bool(np.isclose(norm, 1.0, atol=atol, rtol=0))
+
+    def decompose(
+        self,
+        irreps: Sequence["Representation"],
+        group_elements: Sequence[Element],
+        atol: float = 1e-8,
+    ) -> Dict[str, int]:
+        """Decompose an already-validated representation by characters."""
+        atol = _tolerance(atol)
+        elements = self._require_elements(group_elements)
+        names = [irrep.name for irrep in irreps]
+        if len(set(names)) != len(names):
+            raise ValueError("irrep names must be unique")
+
+        multiplicities: Dict[str, int] = {}
         for irrep in irreps:
-            inner_product = 0
-            for g in group_elements:
-                chi_irrep = np.conj(irrep.character(g))
-                chi_self = self.character(g)
-                inner_product += chi_irrep * chi_self
-            
-            multiplicity = int(np.round(inner_product.real / len(group_elements)))
-            if multiplicity > 0:
-                multiplicities[irrep.name] = multiplicity
-        
+            value = irrep.character_inner_product(self, elements)
+            rounded = int(round(value.real))
+            if abs(value.imag) > atol or rounded < 0 or not np.isclose(
+                value.real, rounded, atol=atol, rtol=0
+            ):
+                raise ValueError(
+                    f"character inner product for {irrep.name!r} is not a "
+                    f"non-negative integer: {value}"
+                )
+            if rounded:
+                multiplicities[irrep.name] = rounded
         return multiplicities
 
 
 class CyclicGroup:
-    """
-    Cyclic group Z_n: rotations by 2πk/n.
-    
-    The simplest non-trivial group, fundamental building block.
-    """
-    
+    """The cyclic group ``Z_n`` with elements ``r0`` through ``r(n-1)``."""
+
     def __init__(self, n: int):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("n must be a positive integer")
         self.n = n
-        self.elements = [f"r{k}" for k in range(n)]
-    
-    def multiply(self, g1: str, g2: str) -> str:
-        """Group multiplication: r^a * r^b = r^(a+b mod n)."""
-        a = int(g1[1:])
-        b = int(g2[1:])
-        return f"r{(a + b) % self.n}"
-    
-    def inverse(self, g: str) -> str:
-        """Group inverse: (r^a)^(-1) = r^(n-a)."""
-        a = int(g[1:])
-        return f"r{(self.n - a) % self.n}"
-    
+        self.elements = [f"r{index}" for index in range(n)]
+
+    def _index(self, element: object) -> int:
+        if not isinstance(element, str) or element not in self.elements:
+            raise ValueError(f"{element!r} is not a valid element of Z_{self.n}")
+        return int(element[1:])
+
+    def multiply(self, first: Element, second: Element) -> str:
+        """Return ``r^a r^b = r^(a+b mod n)``."""
+        return f"r{(self._index(first) + self._index(second)) % self.n}"
+
+    def inverse(self, element: object) -> str:
+        """Return the group inverse."""
+        return f"r{(-self._index(element)) % self.n}"
+
     def identity(self) -> str:
         return "r0"
-    
+
     def regular_representation(self) -> Representation:
-        """
-        Regular representation: group acts on itself by left multiplication.
-        
-        Dimension = |G| = n.
-        """
-        matrices = {}
-        for g in self.elements:
+        """Return the ``n``-dimensional left regular representation."""
+        matrices: Dict[Element, NDArray] = {}
+        for element in self.elements:
             matrix = np.zeros((self.n, self.n), dtype=complex)
-            for i, h in enumerate(self.elements):
-                gh = self.multiply(g, h)
-                j = self.elements.index(gh)
-                matrix[j, i] = 1.0
-            matrices[g] = matrix
-        
+            for column, basis_element in enumerate(self.elements):
+                row = self.elements.index(self.multiply(element, basis_element))
+                matrix[row, column] = 1.0
+            matrices[element] = matrix
         return Representation(f"Regular_Z{self.n}", self.n, matrices)
-    
+
     def irreducible_representations(self) -> List[Representation]:
-        """
-        All irreducible representations of Z_n.
-        
-        Z_n has n irreps, all 1-dimensional:
-        ρ_k(r) = exp(2πi k/n) for k = 0, 1, ..., n-1
-        """
-        irreps = []
+        """Return all ``n`` one-dimensional irreducible representations."""
         omega = np.exp(2j * np.pi / self.n)
-        
-        for k in range(self.n):
-            matrices = {}
-            for j in range(self.n):
-                # r^j maps to omega^(k*j)
-                matrices[f"r{j}"] = np.array([[omega ** (k * j)]], dtype=complex)
-            irreps.append(Representation(f"χ{k}", 1, matrices))
-        
+        irreps: List[Representation] = []
+        for mode in range(self.n):
+            matrices = {
+                f"r{power}": np.array([[omega ** (mode * power)]], dtype=complex)
+                for power in range(self.n)
+            }
+            irreps.append(Representation(f"χ{mode}", 1, matrices))
         return irreps
 
 
 class SymmetricGroup:
-    """
-    Symmetric group S_n: all permutations of n elements.
-    
-    Fundamental group in combinatorics and physics.
-    |S_n| = n!
-    """
-    
+    """The symmetric group ``S_n`` using standard permutation composition."""
+
     def __init__(self, n: int):
+        if isinstance(n, bool) or not isinstance(n, int) or n < 2:
+            raise ValueError("n must be an integer at least 2")
+        if n > 8:
+            raise ValueError("n must not exceed 8; this implementation materializes n! elements")
         self.n = n
-        self.elements = self._generate_permutations()
-    
-    def _generate_permutations(self) -> List[Tuple[int, ...]]:
-        """Generate all permutations of {0, 1, ..., n-1}."""
-        from itertools import permutations
-        return list(permutations(range(self.n)))
-    
-    def multiply(self, p1: Tuple[int, ...], p2: Tuple[int, ...]) -> Tuple[int, ...]:
-        """
-        Permutation composition: (p1 ∘ p2)(i) = p2(p1(i)).
-        
-        Apply p1 first, then p2 (left-to-right).
-        """
-        return tuple(p2[p1[i]] for i in range(self.n))
-    
-    def inverse(self, p: Tuple[int, ...]) -> Tuple[int, ...]:
-        """Permutation inverse."""
-        inv = [0] * self.n
-        for i, j in enumerate(p):
-            inv[j] = i
-        return tuple(inv)
-    
+        self.elements = list(permutations(range(n)))
+
+    def _permutation(self, value: object) -> Tuple[int, ...]:
+        if (
+            not isinstance(value, tuple)
+            or len(value) != self.n
+            or any(type(item) is not int for item in value)
+            or set(value) != set(range(self.n))
+        ):
+            raise ValueError(f"{value!r} is not a valid permutation in S_{self.n}")
+        return value
+
+    def multiply(self, first: Element, second: Element) -> Tuple[int, ...]:
+        """Return ``first ∘ second``: apply ``second``, then ``first``."""
+        left = self._permutation(first)
+        right = self._permutation(second)
+        return tuple(left[right[index]] for index in range(self.n))
+
+    def inverse(self, value: object) -> Tuple[int, ...]:
+        """Return a permutation inverse."""
+        permutation_value = self._permutation(value)
+        inverse_value = [0] * self.n
+        for source, target in enumerate(permutation_value):
+            inverse_value[target] = source
+        return tuple(inverse_value)
+
     def identity(self) -> Tuple[int, ...]:
         return tuple(range(self.n))
-    
-    def sign(self, p: Tuple[int, ...]) -> int:
-        """
-        Sign of permutation: +1 if even, -1 if odd.
-        
-        Counts number of inversions.
-        """
-        inversions = 0
-        for i in range(self.n):
-            for j in range(i + 1, self.n):
-                if p[i] > p[j]:
-                    inversions += 1
+
+    def sign(self, value: object) -> int:
+        """Return ``+1`` for even and ``-1`` for odd permutations."""
+        permutation_value = self._permutation(value)
+        inversions = sum(
+            permutation_value[i] > permutation_value[j]
+            for i in range(self.n)
+            for j in range(i + 1, self.n)
+        )
         return 1 if inversions % 2 == 0 else -1
-    
+
     def trivial_representation(self) -> Representation:
-        """Trivial representation: all elements map to 1."""
-        matrices = {}
-        for p in self.elements:
-            matrices[p] = np.array([[1.0]])
+        matrices = {element: np.ones((1, 1)) for element in self.elements}
         return Representation("Trivial", 1, matrices)
-    
+
     def sign_representation(self) -> Representation:
-        """Sign representation: p maps to sign(p)."""
-        matrices = {}
-        for p in self.elements:
-            matrices[p] = np.array([[float(self.sign(p))]])
+        matrices = {
+            element: np.array([[self.sign(element)]], dtype=complex)
+            for element in self.elements
+        }
         return Representation("Sign", 1, matrices)
-    
+
+    def permutation_representation(self) -> Representation:
+        """Return the natural ``n``-dimensional permutation representation."""
+        matrices: Dict[Element, NDArray] = {}
+        for element in self.elements:
+            matrix = np.zeros((self.n, self.n), dtype=complex)
+            for column in range(self.n):
+                matrix[element[column], column] = 1.0
+            matrices[element] = matrix
+        return Representation("Permutation", self.n, matrices)
+
     def standard_representation(self) -> Representation:
-        """
-        Standard representation: permutation matrices on R^n.
-        
-        Dimension = n.
-        """
-        matrices = {}
-        for p in self.elements:
-            matrix = np.zeros((self.n, self.n))
-            for i in range(self.n):
-                matrix[p[i], i] = 1.0
-            matrices[p] = matrix
-        return Representation("Standard", self.n, matrices)
-    
+        """Return the true ``(n-1)``-dimensional sum-zero representation."""
+        basis = np.zeros((self.n, self.n - 1), dtype=float)
+        for column in range(self.n - 1):
+            count = column + 1
+            scale = np.sqrt(count * (count + 1))
+            basis[:count, column] = 1.0 / scale
+            basis[count, column] = -count / scale
+
+        permutation_rep = self.permutation_representation()
+        matrices = {
+            element: basis.T @ permutation_rep.matrices[element] @ basis
+            for element in self.elements
+        }
+        return Representation("Standard", self.n - 1, matrices)
+
     def character_table(self) -> Dict[str, List[complex]]:
-        """
-        Compute character table for small symmetric groups.
-        
-        Returns: {irrep_name: [χ(g1), χ(g2), ...]}
-        """
-        # For S_3, we have 3 irreps: trivial, sign, standard (2D)
+        """Return all irreducible character rows for ``S_3``."""
         if self.n != 3:
-            raise NotImplementedError("Character table only implemented for S_3")
-        
-        table = {}
-        
-        # Trivial
-        trivial = self.trivial_representation()
-        table["Trivial"] = [trivial.character(p) for p in self.elements]
-        
-        # Sign
-        sign_rep = self.sign_representation()
-        table["Sign"] = [sign_rep.character(p) for p in self.elements]
-        
-        # Standard (2D irrep)
-        std = self.standard_representation()
-        table["Standard"] = [std.character(p) for p in self.elements]
-        
-        return table
+            raise NotImplementedError("Character table is implemented only for S_3")
+        irreps = (
+            self.trivial_representation(),
+            self.sign_representation(),
+            self.standard_representation(),
+        )
+        return {
+            irrep.name: [irrep.character(element) for element in self.elements]
+            for irrep in irreps
+        }
 
 
 class AgentSymmetryAnalyzer:
-    """
-    Analyze agent coordination patterns using representation theory.
-    
-    Decomposes complex multi-agent behaviors into fundamental symmetry modes.
-    """
-    
-    def __init__(self, group):
+    """Analyze deterministic cyclic coordination-mode representations."""
+
+    def __init__(self, group: object):
         self.group = group
-        self.observations: List[Dict] = []
-    
-    def observe_coordination(self, group_element, description: str):
-        """Record an observed coordination pattern."""
-        self.observations.append({
-            "element": group_element,
-            "description": description
-        })
-    
+        self._observations: Dict[Element, str] = {}
+
+    @property
+    def observations(self) -> List[Dict[str, object]]:
+        """Return observations in group order when available."""
+        elements = getattr(self.group, "elements", tuple(self._observations))
+        return [
+            {"element": element, "description": self._observations[element]}
+            for element in elements
+            if element in self._observations
+        ]
+
+    def observe_coordination(self, group_element: Element, description: str) -> None:
+        """Record or replace a label for one known group element."""
+        elements = getattr(self.group, "elements", None)
+        if elements is None or group_element not in elements:
+            raise ValueError(f"{group_element!r} is not a known group element")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("description must be a non-empty string")
+        self._observations[group_element] = description
+
     def build_observed_representation(self, dim: int) -> Representation:
+        """Build a deterministic synthetic cyclic representation from all labels.
+
+        The complete ordered label set selects ``dim`` cyclic irreducible modes by
+        SHA-256. This is a reproducible test adapter, not learned semantic inference.
         """
-        Build representation from observed coordination patterns.
-        
-        Maps each observed group element to a matrix encoding the pattern.
-        """
-        matrices = {}
-        
-        for obs in self.observations:
-            g = obs["element"]
-            # Create a matrix encoding this coordination pattern
-            # (simplified: use random matrices for demonstration)
-            np.random.seed(hash(str(g)) % (2**32))
-            matrix = np.random.randn(dim, dim) + 1j * np.random.randn(dim, dim)
-            # Make invertible
-            matrix = matrix + dim * np.eye(dim)
-            matrices[g] = matrix
-        
-        return Representation("Observed", dim, matrices)
-    
+        if not isinstance(self.group, CyclicGroup):
+            raise NotImplementedError("observed representations support cyclic groups only")
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("dim must be a positive integer")
+        if set(self._observations) != set(self.group.elements):
+            raise ValueError("one observation is required for every group element")
+
+        payload = json.dumps(
+            [(element, self._observations[element]) for element in self.group.elements],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        modes = [
+            int.from_bytes(
+                hashlib.sha256(payload + coordinate.to_bytes(8, "big")).digest(),
+                "big",
+            )
+            % self.group.n
+            for coordinate in range(dim)
+        ]
+        omega = np.exp(2j * np.pi / self.group.n)
+        matrices = {
+            f"r{power}": np.diag([omega ** (mode * power) for mode in modes])
+            for power in range(self.group.n)
+        }
+        return Representation("ObservedSynthetic", dim, matrices)
+
     def decompose_coordination(self, representation: Representation) -> Dict[str, int]:
+        """Decompose a cyclic representation into irreducible modes."""
+        if not isinstance(self.group, CyclicGroup):
+            raise NotImplementedError("decomposition supports cyclic groups only")
+        return representation.decompose(
+            self.group.irreducible_representations(), self.group.elements
+        )
+
+    def detect_symmetry_breaking(
+        self, representation: Representation, atol: float = 1e-9
+    ) -> List[Element]:
+        """Return elements whose represented action is non-identity.
+
+        This diagnoses non-trivial action. Physical symmetry breaking additionally
+        requires a state or observable, which this compact API does not model.
         """
-        Decompose observed coordination into fundamental modes.
-        
-        Returns: {mode_name: multiplicity}
-        """
-        if isinstance(self.group, CyclicGroup):
-            irreps = self.group.irreducible_representations()
-        else:
-            raise NotImplementedError("Only cyclic groups supported for decomposition")
-        
-        return representation.decompose(irreps, self.group.elements)
-    
-    def detect_symmetry_breaking(self, representation: Representation) -> List[str]:
-        """
-        Detect which symmetries are broken by the coordination pattern.
-        
-        A symmetry is broken if the representation is not invariant under it.
-        """
-        broken = []
-        
-        # Check if representation is trivial (fully symmetric)
-        identity_matrix = np.eye(representation.dim)
-        for g, matrix in representation.matrices.items():
-            if not np.allclose(matrix, identity_matrix):
-                broken.append(g)
-        
-        return broken
-    
-    def compute_selection_rules(self, initial_irrep: str, final_irrep: str,
-                                operator_irrep: str, irreps: List[Representation]) -> bool:
-        """
-        Compute selection rules for transitions.
-        
-        A transition from initial to final state via operator is allowed iff
-        the tensor product contains the trivial representation:
-        
-        Γ_initial ⊗ Γ_operator ⊗ Γ_final ⊃ Γ_trivial
-        
-        Returns: True if transition is allowed.
-        """
-        # Find the irreps
+        atol = _tolerance(atol)
+        identity = np.eye(representation.dim, dtype=complex)
+        return [
+            element
+            for element, matrix in representation.matrices.items()
+            if not np.allclose(matrix, identity, atol=atol, rtol=0)
+        ]
+
+    def compute_selection_rules(
+        self,
+        initial_irrep: str,
+        final_irrep: str,
+        operator_irrep: str,
+        irreps: Sequence[Representation],
+        atol: float = 1e-8,
+    ) -> bool:
+        """Return whether ``initial ⊗ operator`` contains ``final``."""
+        atol = _tolerance(atol)
         irrep_dict = {irrep.name: irrep for irrep in irreps}
-        
-        if initial_irrep not in irrep_dict:
-            raise ValueError(f"Unknown irrep: {initial_irrep}")
-        if final_irrep not in irrep_dict:
-            raise ValueError(f"Unknown irrep: {final_irrep}")
-        if operator_irrep not in irrep_dict:
-            raise ValueError(f"Unknown irrep: {operator_irrep}")
-        
-        # Compute character of tensor product
-        allowed = False
-        for g in self.group.elements:
-            chi_initial = irrep_dict[initial_irrep].character(g)
-            chi_operator = irrep_dict[operator_irrep].character(g)
-            chi_final = np.conj(irrep_dict[final_irrep].character(g))
-            
-            # Check if trivial representation appears
-            chi_product = chi_initial * chi_operator * chi_final
-            
-            # For cyclic groups, check if sum over all elements gives |G|
-            if isinstance(self.group, CyclicGroup):
-                if np.isclose(chi_product, 1.0):
-                    allowed = True
-                    break
-        
-        return allowed
+        for name in (initial_irrep, final_irrep, operator_irrep):
+            if name not in irrep_dict:
+                raise ValueError(f"Unknown irrep: {name}")
+        elements = _group_elements(getattr(self.group, "elements", ()))
+        value = sum(
+            irrep_dict[initial_irrep].character(element)
+            * irrep_dict[operator_irrep].character(element)
+            * np.conj(irrep_dict[final_irrep].character(element))
+            for element in elements
+        ) / len(elements)
+        rounded = int(round(value.real))
+        return bool(
+            abs(value.imag) <= atol
+            and rounded > 0
+            and np.isclose(value.real, rounded, atol=atol, rtol=0)
+        )
 
 
-def demo():
-    """Demonstrate representation theory for agent coordination."""
+def demo() -> None:
+    """Run a deterministic, locally verifiable example."""
     print("=" * 70)
     print("AGENT REPRESENTATION THEORY DEMO")
     print("=" * 70)
-    print()
-    
-    # Cyclic group Z_4
-    print("1. CYCLIC GROUP Z_4 (Rotations by 90°)")
-    print("-" * 70)
-    Z4 = CyclicGroup(4)
-    print(f"Elements: {Z4.elements}")
-    print(f"Order: {len(Z4.elements)}")
-    print()
-    
-    # Irreducible representations
-    print("Irreducible Representations:")
-    irreps = Z4.irreducible_representations()
-    for irrep in irreps:
-        print(f"  {irrep.name}: dimension {irrep.dim}")
-        chi_e = irrep.character("r0")
-        chi_r = irrep.character("r1")
-        print(f"    χ(e) = {chi_e:.3f}, χ(r) = {chi_r:.3f}")
-    print()
-    
-    # Regular representation
-    print("Regular Representation:")
-    regular = Z4.regular_representation()
-    print(f"  Dimension: {regular.dim}")
-    print(f"  Faithful: {regular.is_faithful()}")
-    print(f"  Irreducible: {regular.is_irreducible(Z4.elements)}")
-    print()
-    
-    # Decompose regular representation
-    print("Decomposition of Regular Representation:")
-    decomp = regular.decompose(irreps, Z4.elements)
-    for name, mult in decomp.items():
-        print(f"  {name}: multiplicity {mult}")
-    print()
-    
-    # Symmetric group S_3
-    print("2. SYMMETRIC GROUP S_3 (Permutations of 3 elements)")
-    print("-" * 70)
-    S3 = SymmetricGroup(3)
-    print(f"Order: {len(S3.elements)}")
-    print(f"Elements: {S3.elements[:3]} ... (showing first 3)")
-    print()
-    
-    # Representations
-    print("Representations:")
-    trivial = S3.trivial_representation()
-    sign_rep = S3.sign_representation()
-    standard = S3.standard_representation()
-    
-    print(f"  Trivial: dimension {trivial.dim}")
-    print(f"  Sign: dimension {sign_rep.dim}")
-    print(f"  Standard: dimension {standard.dim}")
-    print()
-    
-    # Character table
-    print("Character Table (first 3 elements):")
-    char_table = S3.character_table()
-    for name, chars in char_table.items():
-        print(f"  {name:10s}: {chars[:3]}")
-    print()
-    
-    # Agent coordination analysis
-    print("3. AGENT COORDINATION ANALYSIS")
-    print("-" * 70)
-    
-    analyzer = AgentSymmetryAnalyzer(Z4)
-    
-    # Observe some coordination patterns
-    print("Observing coordination patterns:")
-    patterns = [
+
+    cyclic = CyclicGroup(4)
+    irreps = cyclic.irreducible_representations()
+    regular = cyclic.regular_representation()
+    valid = regular.is_representation(
+        cyclic.elements,
+        cyclic.multiply,
+        cyclic.identity(),
+    )
+    print(f"Z_4 regular representation valid: {valid}")
+    print(f"Z_4 regular decomposition: {regular.decompose(irreps, cyclic.elements)}")
+
+    symmetric = SymmetricGroup(3)
+    standard = symmetric.standard_representation()
+    print(f"S_3 standard dimension: {standard.dim}")
+    print(f"S_3 standard irreducible: {standard.is_irreducible(symmetric.elements)}")
+
+    analyzer = AgentSymmetryAnalyzer(cyclic)
+    for element, description in (
         ("r0", "synchronized"),
-        ("r1", "rotated 90°"),
+        ("r1", "quarter turn"),
         ("r2", "opposed"),
-        ("r3", "rotated 270°"),
-    ]
-    for elem, desc in patterns:
-        analyzer.observe_coordination(elem, desc)
-        print(f"  {elem}: {desc}")
-    print()
-    
-    # Build observed representation
-    print("Building observed representation (dimension 2):")
-    observed = analyzer.build_observed_representation(2)
-    print(f"  Dimension: {observed.dim}")
-    print(f"  Faithful: {observed.is_faithful()}")
-    print()
-    
-    # Decompose
-    print("Decomposition into fundamental modes:")
-    decomp = analyzer.decompose_coordination(observed)
-    for mode, mult in decomp.items():
-        print(f"  {mode}: multiplicity {mult}")
-    print()
-    
-    # Detect symmetry breaking
-    print("Symmetry breaking analysis:")
-    broken = analyzer.detect_symmetry_breaking(observed)
-    if broken:
-        print(f"  Broken symmetries: {broken}")
-    else:
-        print("  All symmetries preserved")
-    print()
-    
-    # Selection rules
-    print("Selection rules for transitions:")
-    print("  Can χ0 transition to χ1 via χ1 operator?")
-    allowed = analyzer.compute_selection_rules("χ0", "χ1", "χ1", irreps)
-    print(f"    Allowed: {allowed}")
-    print()
-    
-    print("  Can χ0 transition to χ2 via χ1 operator?")
-    allowed = analyzer.compute_selection_rules("χ0", "χ2", "χ1", irreps)
-    print(f"    Allowed: {allowed}")
-    print()
-    
-    print("=" * 70)
+        ("r3", "three-quarter turn"),
+    ):
+        analyzer.observe_coordination(element, description)
+    observed = analyzer.build_observed_representation(3)
+    valid = observed.is_representation(cyclic.elements, cyclic.multiply, cyclic.identity())
+    print(f"Observed representation valid: {valid}")
+    print(f"Observed decomposition: {analyzer.decompose_coordination(observed)}")
+    print(
+        "Selection χ0 -> χ1 through χ1: "
+        f"{analyzer.compute_selection_rules('χ0', 'χ1', 'χ1', irreps)}"
+    )
     print("DEMONSTRATION COMPLETE")
-    print("=" * 70)
-    print()
-    print("Key Insights:")
-    print("  • Representations make abstract symmetry concrete")
-    print("  • Characters provide fingerprints for classification")
-    print("  • Decomposition reveals fundamental coordination modes")
-    print("  • Selection rules constrain allowed transitions")
-    print("  • Symmetry breaking indicates phase transitions")
 
 
 if __name__ == "__main__":
